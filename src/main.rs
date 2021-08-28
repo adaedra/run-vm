@@ -1,11 +1,17 @@
 mod qemu {
     use json::JsonValue;
-    use std::fmt;
+    use log::debug;
+    use std::{
+        collections::VecDeque,
+        error, fmt,
+        io::{BufRead, BufReader},
+        process::{Child, ChildStdin, ChildStdout},
+    };
 
     pub struct Version(u8, u8, u8);
 
     impl Version {
-        pub fn from_json(json: &JsonValue) -> Version {
+        fn from_json(json: &JsonValue) -> Version {
             Version(
                 json["major"].as_u8().unwrap(),
                 json["minor"].as_u8().unwrap(),
@@ -19,12 +25,109 @@ mod qemu {
             write!(f, "{}.{}.{}", self.0, self.1, self.2)
         }
     }
+
+    pub struct Eof;
+
+    impl fmt::Debug for Eof {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "QMP Channel Closed")
+        }
+    }
+
+    impl fmt::Display for Eof {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            (self as &dyn fmt::Debug).fmt(f)
+        }
+    }
+
+    impl error::Error for Eof {}
+
+    pub struct Process {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+
+        event_cache: VecDeque<JsonValue>,
+    }
+
+    impl Process {
+        pub fn init(args: &[String]) -> anyhow::Result<Process> {
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new("qemu-system-x86_64")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+            let mut greeting = String::new();
+            if stdout.read_line(&mut greeting)? == 0 {
+                return Err(Eof.into());
+            }
+            debug!("QMP: Recv {}", greeting.trim());
+
+            let json = json::parse(&greeting)?;
+            let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
+            debug!("QMP: Connected, version {}", version);
+
+            let mut p = Process {
+                child,
+                stdin,
+                stdout,
+                event_cache: VecDeque::new(),
+            };
+            p.write(&json::object! { "execute": "qmp_capabilities" })?;
+            Ok(p)
+        }
+
+        pub fn write(&mut self, data: &JsonValue) -> anyhow::Result<JsonValue> {
+            use std::io::Write;
+
+            debug!("QMP: Send {}", data);
+            writeln!(self.stdin, "{}", data)?;
+
+            loop {
+                let mut line = String::new();
+                if self.stdout.read_line(&mut line)? == 0 {
+                    return Err(Eof.into());
+                }
+                debug!("QMP: Recv {}", line.trim());
+
+                let json = json::parse(&line)?;
+                if json.has_key("event") {
+                    self.event_cache.push_back(json);
+                } else {
+                    return Ok(json["return"].clone());
+                }
+            }
+        }
+
+        pub fn read_event(&mut self) -> anyhow::Result<JsonValue> {
+            if let Some(v) = self.event_cache.pop_front() {
+                return Ok(v);
+            }
+
+            let mut event = String::new();
+            if self.stdout.read_line(&mut event)? == 0 {
+                return Err(Eof.into());
+            }
+
+            debug!("QMP: Recv {}", event);
+            Ok(json::parse(&event)?)
+        }
+
+        pub fn finish(mut self) -> anyhow::Result<()> {
+            self.child.wait().map(|_| ()).map_err(Into::into)
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
-    use log::debug;
+    use log::{debug, info};
     use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
 
     {
         use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
@@ -67,60 +170,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     debug!("QEMU Arguments: {:?}", &options);
-    let mut qemu = Command::new("qemu-system-x86_64")
-        .args(options)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let mut qemu_in = qemu.stdin.take().unwrap();
-    let qemu_out = qemu.stdout.take().unwrap();
-    let mut reader = BufReader::new(qemu_out);
-
-    let mut version = Option::<qemu::Version>::None;
+    let mut child = qemu::Process::init(&options)?;
+    info!("Qemu: Ready");
 
     loop {
-        // for line in reader.lines() {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
+        let event = child.read_event();
+        println!("{:?}", event);
+
+        match event {
             Ok(_) => (),
-            Err(e) => return Err(e.into()),
-        };
-
-        debug!("QMP Read: {}", line);
-
-        if version.is_none() {
-            use std::io::Write;
-
-            version = Some({
-                let json = json::parse(&line)?;
-                let version = qemu::Version::from_json(&json["QMP"]["version"]["qemu"]);
-                debug!("QMP Connected, version {}", version);
-
-                version
-            });
-
-            let msg = json::object! { "execute": "qmp_capabilities" };
-            writeln!(qemu_in, "{}", msg.to_string())?;
-
-            let mut reply = String::new();
-            match reader.read_line(&mut reply) {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(e) => return Err(e.into()),
-            };
-            debug!("QMP Read: {}", reply);
-
-            let reply_json = json::parse(&reply)?;
-            if !reply_json.has_key("return") {
-                panic!("Error initializing QMP channel");
-            }
+            Err(e) if e.is::<qemu::Eof>() => break,
+            Err(e) => return Err(e),
         }
     }
 
-    let status = qemu.wait()?;
-    println!("{:?}", status);
-
-    Ok(())
+    child.finish()
 }
