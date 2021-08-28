@@ -61,10 +61,17 @@ mod qemu {
                 .spawn()?;
 
             let stdin = child.stdin.take().unwrap();
-            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+
+            let mut p = Process {
+                child,
+                stdin,
+                stdout,
+                event_cache: VecDeque::new(),
+            };
 
             let mut greeting = String::new();
-            if stdout.read_line(&mut greeting)? == 0 {
+            if p.stdout.read_line(&mut greeting)? == 0 {
                 return Err(Eof.into());
             }
             debug!("QMP: Recv {}", greeting.trim());
@@ -73,12 +80,6 @@ mod qemu {
             let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
             debug!("QMP: Connected, version {}", version);
 
-            let mut p = Process {
-                child,
-                stdin,
-                stdout,
-                event_cache: VecDeque::new(),
-            };
             p.write(&json::object! { "execute": "qmp_capabilities" })?;
             Ok(p)
         }
@@ -118,9 +119,18 @@ mod qemu {
             debug!("QMP: Recv {}", event);
             Ok(json::parse(&event)?)
         }
+    }
 
-        pub fn finish(mut self) -> anyhow::Result<()> {
-            self.child.wait().map(|_| ()).map_err(Into::into)
+    impl Drop for Process {
+        fn drop(&mut self) {
+            use log::error;
+            debug!("Qemu: Waiting");
+
+            match self.child.wait() {
+                Ok(s) if s.success() => (),
+                Ok(s) => error!("Qemu: Exited, {}", &s),
+                Err(e) => error!("Qemu: Error: {}", e),
+            }
         }
     }
 }
@@ -179,10 +189,7 @@ fn main() -> anyhow::Result<()> {
 
         match event {
             Ok(_) => (),
-            Err(e) if e.is::<qemu::Eof>() => break,
             Err(e) => return Err(e),
         }
     }
-
-    child.finish()
 }
