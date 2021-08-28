@@ -1,3 +1,10 @@
 [package]
 name = "run-vm"
 version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0"
+json = "0.12"
+log = "0.4"
+simplelog = "0.10"
