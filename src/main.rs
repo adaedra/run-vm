@@ -1,6 +1,5 @@
 mod qemu {
     use json::JsonValue;
-    use log::debug;
     use std::{collections::VecDeque, error, fmt};
     use tokio::{
         io::BufReader,
@@ -51,6 +50,7 @@ mod qemu {
 
     impl Process {
         pub async fn init(args: &[String]) -> anyhow::Result<Process> {
+            use log::{debug, trace};
             use std::process::Stdio;
             use tokio::{io::AsyncBufReadExt, process::Command};
 
@@ -75,7 +75,7 @@ mod qemu {
                 p.finish().await;
                 return Err(Eof.into());
             }
-            debug!("QMP: Recv {}", greeting.trim());
+            trace!("QMP: Recv {}", greeting.trim());
 
             let json = json::parse(&greeting)?;
             let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
@@ -97,9 +97,10 @@ mod qemu {
         }
 
         pub async fn write(&mut self, data: &JsonValue) -> anyhow::Result<JsonValue> {
+            use log::trace;
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-            debug!("QMP: Send {}", data);
+            trace!("QMP: Send {}", data);
             let mut msg = data.to_string();
             msg.push('\n');
             self.stdin.write_all(msg.as_bytes()).await?;
@@ -109,7 +110,7 @@ mod qemu {
                 if self.stdout.read_line(&mut line).await? == 0 {
                     return Err(Eof.into());
                 }
-                debug!("QMP: Recv {}", line.trim());
+                trace!("QMP: Recv {}", line.trim());
 
                 let json = json::parse(&line)?;
                 if json.has_key("event") {
@@ -121,6 +122,7 @@ mod qemu {
         }
 
         pub async fn read_event(&mut self) -> anyhow::Result<JsonValue> {
+            use log::trace;
             use tokio::io::AsyncBufReadExt;
 
             if let Some(v) = self.event_cache.pop_front() {
@@ -132,13 +134,13 @@ mod qemu {
                 return Err(Eof.into());
             }
 
-            debug!("QMP: Recv {}", event);
+            trace!("QMP: Recv {}", event);
             Ok(json::parse(&event)?)
         }
 
         pub async fn finish(mut self) {
-            use log::error;
-            debug!("Qemu: wait");
+            use log::{error, trace};
+            trace!("Qemu: wait");
 
             match self.child.wait().await {
                 Ok(s) if s.success() => (),
@@ -151,14 +153,14 @@ mod qemu {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use log::{debug, info};
+    use log::{debug, info, trace};
     use std::io::{BufRead, BufReader};
 
     {
         use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
 
         TermLogger::init(
-            LevelFilter::Debug,
+            LevelFilter::Trace,
             Config::default(),
             TerminalMode::Mixed,
             ColorChoice::Auto,
@@ -171,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
         let path = env::args().skip(1).next().unwrap_or_else(|| ".".to_owned());
         let root = Path::new(&path).canonicalize()?;
 
-        debug!("Working directory: {}", root.display());
+        trace!("Working directory: {}", root.display());
         env::set_current_dir(&root)?;
         root
     };
@@ -194,9 +196,28 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     };
 
-    debug!("QEMU Arguments: {:?}", &options);
+    trace!("QEMU Arguments: {:?}", &options);
     let mut child = qemu::Process::init(&options).await?;
     info!("Qemu: Ready");
+
+    let cpus = child
+        .write(&json::object! { "execute": "query-cpus-fast" })
+        .await?;
+    for cpu in cpus.members() {
+        use nix::{
+            sched::{sched_setaffinity, CpuSet},
+            unistd::Pid,
+        };
+
+        let index = cpu["cpu-index"].as_usize().unwrap();
+        let pid = cpu["thread-id"].as_usize().unwrap();
+
+        debug!("vCPU {} => PID {}", index, pid);
+        let mut cpu_mask = CpuSet::new();
+        cpu_mask.set(4 + index).ok();
+
+        sched_setaffinity(Pid::from_raw(pid as libc::pid_t), &cpu_mask)?;
+    }
 
     loop {
         let event = child.read_event().await;
