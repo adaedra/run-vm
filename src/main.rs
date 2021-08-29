@@ -1,10 +1,9 @@
 mod qemu {
     use json::JsonValue;
     use log::debug;
-    use std::{
-        collections::VecDeque,
-        error, fmt,
-        io::{BufRead, BufReader},
+    use std::{collections::VecDeque, error, fmt};
+    use tokio::{
+        io::BufReader,
         process::{Child, ChildStdin, ChildStdout},
     };
 
@@ -51,8 +50,9 @@ mod qemu {
     }
 
     impl Process {
-        pub fn init(args: &[String]) -> anyhow::Result<Process> {
-            use std::process::{Command, Stdio};
+        pub async fn init(args: &[String]) -> anyhow::Result<Process> {
+            use std::process::Stdio;
+            use tokio::{io::AsyncBufReadExt, process::Command};
 
             let mut child = Command::new("qemu-system-x86_64")
                 .args(args)
@@ -71,7 +71,8 @@ mod qemu {
             };
 
             let mut greeting = String::new();
-            if p.stdout.read_line(&mut greeting)? == 0 {
+            if p.stdout.read_line(&mut greeting).await? == 0 {
+                p.finish().await;
                 return Err(Eof.into());
             }
             debug!("QMP: Recv {}", greeting.trim());
@@ -80,19 +81,32 @@ mod qemu {
             let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
             debug!("QMP: Connected, version {}", version);
 
-            p.write(&json::object! { "execute": "qmp_capabilities" })?;
+            match p
+                .write(&json::object! { "execute": "qmp_capabilities" })
+                .await
+            {
+                Ok(_) => (),
+                Err(e) if e.is::<Eof>() => {
+                    p.finish().await;
+                    return Err(e.into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+
             Ok(p)
         }
 
-        pub fn write(&mut self, data: &JsonValue) -> anyhow::Result<JsonValue> {
-            use std::io::Write;
+        pub async fn write(&mut self, data: &JsonValue) -> anyhow::Result<JsonValue> {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
             debug!("QMP: Send {}", data);
-            writeln!(self.stdin, "{}", data)?;
+            let mut msg = data.to_string();
+            msg.push('\n');
+            self.stdin.write_all(msg.as_bytes()).await?;
 
             loop {
                 let mut line = String::new();
-                if self.stdout.read_line(&mut line)? == 0 {
+                if self.stdout.read_line(&mut line).await? == 0 {
                     return Err(Eof.into());
                 }
                 debug!("QMP: Recv {}", line.trim());
@@ -106,36 +120,37 @@ mod qemu {
             }
         }
 
-        pub fn read_event(&mut self) -> anyhow::Result<JsonValue> {
+        pub async fn read_event(&mut self) -> anyhow::Result<JsonValue> {
+            use tokio::io::AsyncBufReadExt;
+
             if let Some(v) = self.event_cache.pop_front() {
                 return Ok(v);
             }
 
             let mut event = String::new();
-            if self.stdout.read_line(&mut event)? == 0 {
+            if self.stdout.read_line(&mut event).await? == 0 {
                 return Err(Eof.into());
             }
 
             debug!("QMP: Recv {}", event);
             Ok(json::parse(&event)?)
         }
-    }
 
-    impl Drop for Process {
-        fn drop(&mut self) {
+        pub async fn finish(mut self) {
             use log::error;
-            debug!("Qemu: Waiting");
+            debug!("Qemu: wait");
 
-            match self.child.wait() {
+            match self.child.wait().await {
                 Ok(s) if s.success() => (),
-                Ok(s) => error!("Qemu: Exited, {}", &s),
-                Err(e) => error!("Qemu: Error: {}", e),
-            }
+                Ok(s) => error!("Qemu: exit, {}", s),
+                Err(e) => error!("Qemu: error, {}", e),
+            };
         }
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     use log::{debug, info};
     use std::io::{BufRead, BufReader};
 
@@ -180,16 +195,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     debug!("QEMU Arguments: {:?}", &options);
-    let mut child = qemu::Process::init(&options)?;
+    let mut child = qemu::Process::init(&options).await?;
     info!("Qemu: Ready");
 
     loop {
-        let event = child.read_event();
+        let event = child.read_event().await;
         println!("{:?}", event);
 
         match event {
             Ok(_) => (),
-            Err(e) => return Err(e),
+            Err(e) => {
+                child.finish().await;
+                return Err(e);
+            }
         }
     }
 }
