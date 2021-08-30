@@ -1,3 +1,5 @@
+use json::JsonValue;
+
 mod qemu {
     use json::JsonValue;
     use std::{collections::VecDeque, error, fmt};
@@ -134,7 +136,7 @@ mod qemu {
                 return Err(Eof.into());
             }
 
-            trace!("QMP: Recv {}", event);
+            trace!("QMP: Recv {}", event.trim());
             Ok(json::parse(&event)?)
         }
 
@@ -151,9 +153,32 @@ mod qemu {
     }
 }
 
+async fn handle_event(qemu: &mut qemu::Process, event: &JsonValue) -> anyhow::Result<()> {
+    use log::debug;
+
+    let name = event["event"].as_str().unwrap();
+    debug!("Qemu: event {}", name);
+
+    match name {
+        "VNC_INITIALIZED" => {
+            let res = qemu
+                .write(&json::object! { "execute": "query-status" })
+                .await;
+
+            if let Ok(Some("prelaunch")) = res.as_ref().map(|data| data["status"].as_str()) {
+                // Start the machine
+                qemu.write(&json::object! { "execute": "cont"}).await?;
+            }
+        }
+        _ => (),
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use log::{debug, info, trace};
+    use log::{debug, error, info, trace};
     use std::io::{BufRead, BufReader};
 
     {
@@ -215,19 +240,21 @@ async fn main() -> anyhow::Result<()> {
         debug!("vCPU {} => PID {}", index, pid);
         let mut cpu_mask = CpuSet::new();
         cpu_mask.set(4 + index).ok();
-
         sched_setaffinity(Pid::from_raw(pid as libc::pid_t), &cpu_mask)?;
     }
 
     loop {
-        let event = child.read_event().await;
-        println!("{:?}", event);
+        let error = match child.read_event().await {
+            Ok(event) => handle_event(&mut child, &event).await.err(),
+            Err(e) => Some(e),
+        };
 
-        match event {
-            Ok(_) => (),
-            Err(e) => {
+        if let Some(e) = error {
+            if e.is::<qemu::Eof>() {
                 child.finish().await;
                 return Err(e);
+            } else {
+                error!("Error: {}", e);
             }
         }
     }
