@@ -1,7 +1,12 @@
 use futures::channel::{mpsc, oneshot};
 use json::JsonValue;
 use std::{error, fmt, process::ExitStatus};
-use tokio::{io::BufReader, select, task::JoinHandle};
+use tokio::{
+    io::BufReader,
+    process::{Child, ChildStdin, ChildStdout},
+    select,
+    task::JoinHandle,
+};
 
 pub struct Version(u8, u8, u8);
 
@@ -55,7 +60,7 @@ impl Process {
             .stdout(Stdio::piped())
             .spawn()?;
 
-        let mut stdin = child.stdin.take().unwrap();
+        let stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
         let mut greeting = String::new();
@@ -70,54 +75,10 @@ impl Process {
         let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
         debug!("QMP: Connected, version {}", version);
 
-        let (mut event_tx, event_rx) = mpsc::channel(1);
-        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (reply_tx, reply_rx) = mpsc::channel(1);
 
-        let worker = task::spawn(async move {
-            use futures::{SinkExt, StreamExt};
-            use log::error;
-            use tokio::io::AsyncWriteExt;
-
-            let mut reply_waiter = None;
-
-            loop {
-                let mut json = String::new();
-                select! {
-                    biased;
-
-                    msg = reply_rx.next(), if reply_waiter.is_none() => {
-                        let (data, reply_tx): (JsonValue, oneshot::Sender<JsonValue>) = msg.unwrap();
-                        reply_waiter = Some(reply_tx);
-
-                        let reply_buf = data.to_string();
-                        trace!("QMP: Send: {}", &reply_buf);
-                        stdin.write_all(reply_buf.as_bytes()).await.unwrap();
-                    }
-                    read = stdout.read_line(&mut json) => {
-                        match read {
-                            Ok(0) => break,
-                            Ok(_) => (),
-                            Err(e) => panic!("{}", e),
-                        }
-
-                        trace!("QMP: Recv: {}", json.trim());
-                        let data = json::parse(&json).unwrap();
-
-                        if data.has_key("return") {
-                            if let Some(waiter) = reply_waiter.take() {
-                                waiter.send(data["return"].clone()).unwrap();
-                            } else {
-                                error!("Message reply without waiter");
-                            }
-                        } else {
-                            event_tx.send(data).await.unwrap();
-                        }
-                    }
-                };
-            }
-
-            child.wait().await.unwrap()
-        });
+        let worker = task::spawn(qemu_worker(event_tx, reply_rx, child, stdin, stdout));
 
         let mut p = Process {
             worker,
@@ -170,4 +131,56 @@ impl Process {
             error!("Qemu: exited, {}", res);
         }
     }
+}
+
+async fn qemu_worker(
+    mut event_tx: mpsc::Sender<JsonValue>,
+    mut reply_rx: mpsc::Receiver<(JsonValue, oneshot::Sender<JsonValue>)>,
+    mut child: Child,
+    mut stdin: ChildStdin,
+    mut stdout: BufReader<ChildStdout>,
+) -> ExitStatus {
+    use futures::{SinkExt, StreamExt};
+    use log::{error, trace};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut reply_waiter = None;
+
+    loop {
+        let mut json = String::new();
+        select! {
+            biased;
+
+            msg = reply_rx.next(), if reply_waiter.is_none() => {
+                let (data, reply_tx) = msg.unwrap();
+                reply_waiter = Some(reply_tx);
+
+                let reply_buf = data.to_string();
+                trace!("QMP: Send: {}", &reply_buf);
+                stdin.write_all(reply_buf.as_bytes()).await.unwrap();
+            }
+            read = stdout.read_line(&mut json) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(_) => (),
+                    Err(e) => panic!("{}", e),
+                }
+
+                trace!("QMP: Recv: {}", json.trim());
+                let data = json::parse(&json).unwrap();
+
+                if data.has_key("return") {
+                    if let Some(waiter) = reply_waiter.take() {
+                        waiter.send(data["return"].clone()).unwrap();
+                    } else {
+                        error!("Message reply without waiter");
+                    }
+                } else {
+                    event_tx.send(data).await.unwrap();
+                }
+            }
+        };
+    }
+
+    child.wait().await.unwrap()
 }
