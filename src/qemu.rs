@@ -51,14 +51,20 @@ pub struct Process {
 impl Process {
     pub async fn init(args: &[String]) -> anyhow::Result<Process> {
         use log::{debug, trace};
-        use std::process::Stdio;
+        use std::{io, process::Stdio};
         use tokio::{io::AsyncBufReadExt, process::Command, task};
 
-        let mut child = Command::new("qemu-system-x86_64")
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
+        let mut child = unsafe {
+            Command::new("qemu-system-x86_64")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .pre_exec(|| -> io::Result<()> {
+                    use nix::unistd::{setpgid, Pid};
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(Into::into)
+                })
+                .spawn()?
+        };
 
         let stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());

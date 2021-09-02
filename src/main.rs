@@ -1,4 +1,6 @@
+use futures::StreamExt;
 use json::JsonValue;
+use signal_hook_tokio::Signals;
 
 mod qemu;
 
@@ -28,10 +30,12 @@ async fn handle_event(qemu: &mut qemu::Process, event: &JsonValue) -> anyhow::Re
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use log::{debug, error, info, trace};
+    use signal_hook::consts::signal;
     use std::{
         io::{BufRead, BufReader},
         process,
     };
+    use tokio::select;
 
     {
         use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
@@ -95,26 +99,47 @@ async fn main() -> anyhow::Result<()> {
         sched_setaffinity(Pid::from_raw(pid as libc::pid_t), &cpu_mask)?;
     }
 
-    loop {
-        let error = match child.read_event().await {
-            Ok(event) => handle_event(&mut child, &event).await.err(),
-            Err(e) => Some(e),
-        };
+    let signals = Signals::new(&[signal::SIGINT])?;
+    let signal_handle = signals.handle();
+    let mut signals = signals.fuse();
 
-        if let Some(e) = error {
-            if e.is::<qemu::Eof>() {
-                match child.finish().await {
-                    Ok(res) if res.success() => return Ok(()),
-                    Ok(res) => {
-                        error!("Qemu: exit, {}", res);
-                        process::exit(1);
-                    }
-                    Err(e) => return Err(e.into()),
+    loop {
+        select! {
+            biased;
+
+            signal = signals.next(), if !signal_handle.is_closed() => {
+                match signal {
+                    Some(signal::SIGINT) => {
+                        signal_handle.close();
+                        child.write(json::object! { "execute": "quit" }).await.ok();
+                    },
+                    _ => (),
                 }
-            } else {
-                error!("Error: {}", e);
-                return Err(e.into());
             }
-        }
+            event = child.read_event() => {
+                let error = match event {
+                    Ok(event) => handle_event(&mut child, &event).await.err(),
+                    Err(e) => Some(e),
+                };
+
+                if let Some(e) = error {
+                    signal_handle.close();
+
+                    if e.is::<qemu::Eof>() {
+                        match child.finish().await {
+                            Ok(res) if res.success() => return Ok(()),
+                            Ok(res) => {
+                                error!("Qemu: exit, {}", res);
+                                process::exit(1);
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    } else {
+                        error!("Error: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
     }
 }
