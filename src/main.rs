@@ -11,12 +11,12 @@ async fn handle_event(qemu: &mut qemu::Process, event: &JsonValue) -> anyhow::Re
     match name {
         "VNC_INITIALIZED" => {
             let res = qemu
-                .write(&json::object! { "execute": "query-status" })
+                .write(json::object! { "execute": "query-status" })
                 .await;
 
             if let Ok(Some("prelaunch")) = res.as_ref().map(|data| data["status"].as_str()) {
                 // Start the machine
-                qemu.write(&json::object! { "execute": "cont" }).await?;
+                qemu.write(json::object! { "execute": "cont" }).await?;
             }
         }
         _ => (),
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Qemu: Ready");
 
     let cpus = child
-        .write(&json::object! { "execute": "query-cpus-fast" })
+        .write(json::object! { "execute": "query-cpus-fast" })
         .await?;
     for cpu in cpus.members() {
         use nix::{

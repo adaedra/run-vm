@@ -1,9 +1,7 @@
+use futures::channel::{mpsc, oneshot};
 use json::JsonValue;
-use std::{collections::VecDeque, error, fmt};
-use tokio::{
-    io::BufReader,
-    process::{Child, ChildStdin, ChildStdout},
-};
+use std::{error, fmt, process::ExitStatus};
+use tokio::{io::BufReader, select, task::JoinHandle};
 
 pub struct Version(u8, u8, u8);
 
@@ -40,18 +38,16 @@ impl fmt::Display for Eof {
 impl error::Error for Eof {}
 
 pub struct Process {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-
-    event_cache: VecDeque<JsonValue>,
+    worker: JoinHandle<ExitStatus>,
+    event_queue: mpsc::Receiver<JsonValue>,
+    reply_queue: mpsc::Sender<(JsonValue, oneshot::Sender<JsonValue>)>,
 }
 
 impl Process {
     pub async fn init(args: &[String]) -> anyhow::Result<Process> {
         use log::{debug, trace};
         use std::process::Stdio;
-        use tokio::{io::AsyncBufReadExt, process::Command};
+        use tokio::{io::AsyncBufReadExt, process::Command, task};
 
         let mut child = Command::new("qemu-system-x86_64")
             .args(args)
@@ -59,29 +55,78 @@ impl Process {
             .stdout(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-
-        let mut p = Process {
-            child,
-            stdin,
-            stdout,
-            event_cache: VecDeque::new(),
-        };
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
         let mut greeting = String::new();
-        if p.stdout.read_line(&mut greeting).await? == 0 {
-            p.finish().await;
+        if stdout.read_line(&mut greeting).await? == 0 {
+            trace!("Qemu(pre): Wait");
+            child.wait().await.unwrap();
             return Err(Eof.into());
         }
-        trace!("QMP: Recv {}", greeting.trim());
+        trace!("QMP: Recv: {}", greeting.trim());
 
         let json = json::parse(&greeting)?;
         let version = Version::from_json(&json["QMP"]["version"]["qemu"]);
         debug!("QMP: Connected, version {}", version);
 
+        let (mut event_tx, event_rx) = mpsc::channel(1);
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+
+        let worker = task::spawn(async move {
+            use futures::{SinkExt, StreamExt};
+            use log::error;
+            use tokio::io::AsyncWriteExt;
+
+            let mut reply_waiter = None;
+
+            loop {
+                let mut json = String::new();
+                select! {
+                    biased;
+
+                    msg = reply_rx.next(), if reply_waiter.is_none() => {
+                        let (data, reply_tx): (JsonValue, oneshot::Sender<JsonValue>) = msg.unwrap();
+                        reply_waiter = Some(reply_tx);
+
+                        let reply_buf = data.to_string();
+                        trace!("QMP: Send: {}", &reply_buf);
+                        stdin.write_all(reply_buf.as_bytes()).await.unwrap();
+                    }
+                    read = stdout.read_line(&mut json) => {
+                        match read {
+                            Ok(0) => break,
+                            Ok(_) => (),
+                            Err(e) => panic!("{}", e),
+                        }
+
+                        trace!("QMP: Recv: {}", json.trim());
+                        let data = json::parse(&json).unwrap();
+
+                        if data.has_key("return") {
+                            if let Some(waiter) = reply_waiter.take() {
+                                waiter.send(data["return"].clone()).unwrap();
+                            } else {
+                                error!("Message reply without waiter");
+                            }
+                        } else {
+                            event_tx.send(data).await.unwrap();
+                        }
+                    }
+                };
+            }
+
+            child.wait().await.unwrap()
+        });
+
+        let mut p = Process {
+            worker,
+            event_queue: event_rx,
+            reply_queue: reply_tx,
+        };
+
         match p
-            .write(&json::object! { "execute": "qmp_capabilities" })
+            .write(json::object! { "execute": "qmp_capabilities" })
             .await
         {
             Ok(_) => (),
@@ -95,56 +140,34 @@ impl Process {
         Ok(p)
     }
 
-    pub async fn write(&mut self, data: &JsonValue) -> anyhow::Result<JsonValue> {
-        use log::trace;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    pub async fn write(&mut self, data: JsonValue) -> anyhow::Result<JsonValue> {
+        use futures::SinkExt;
 
-        trace!("QMP: Send {}", data);
-        let mut msg = data.to_string();
-        msg.push('\n');
-        self.stdin.write_all(msg.as_bytes()).await?;
+        let (tx, rx) = oneshot::channel();
+        self.reply_queue.send((data, tx)).await?;
 
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line).await? == 0 {
-                return Err(Eof.into());
-            }
-            trace!("QMP: Recv {}", line.trim());
-
-            let json = json::parse(&line)?;
-            if json.has_key("event") {
-                self.event_cache.push_back(json);
-            } else {
-                return Ok(json["return"].clone());
-            }
+        match rx.await {
+            Ok(reply) => Ok(reply),
+            Err(_) => Err(Eof.into()),
         }
     }
 
     pub async fn read_event(&mut self) -> anyhow::Result<JsonValue> {
-        use log::trace;
-        use tokio::io::AsyncBufReadExt;
+        use futures::StreamExt;
 
-        if let Some(v) = self.event_cache.pop_front() {
-            return Ok(v);
+        match self.event_queue.next().await {
+            Some(event) => Ok(event),
+            None => Err(Eof.into()),
         }
-
-        let mut event = String::new();
-        if self.stdout.read_line(&mut event).await? == 0 {
-            return Err(Eof.into());
-        }
-
-        trace!("QMP: Recv {}", event.trim());
-        Ok(json::parse(&event)?)
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(self) {
         use log::{error, trace};
-        trace!("Qemu: wait");
+        trace!("Qemu: Wait");
 
-        match self.child.wait().await {
-            Ok(s) if s.success() => (),
-            Ok(s) => error!("Qemu: exit, {}", s),
-            Err(e) => error!("Qemu: error, {}", e),
-        };
+        let res = self.worker.await.unwrap();
+        if !res.success() {
+            error!("Qemu: exited, {}", res);
+        }
     }
 }

@@ -5,6 +5,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
+futures = "0.3"
 json = "0.12"
 libc = "0.2"
 log = "0.4"
