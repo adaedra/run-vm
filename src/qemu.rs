@@ -138,16 +138,16 @@ async fn qemu_worker(
     mut reply_rx: mpsc::Receiver<(JsonValue, oneshot::Sender<JsonValue>)>,
     mut child: Child,
     mut stdin: ChildStdin,
-    mut stdout: BufReader<ChildStdout>,
+    stdout: BufReader<ChildStdout>,
 ) -> ExitStatus {
     use futures::{SinkExt, StreamExt};
     use log::{error, trace};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let mut reply_waiter = None;
+    let mut lines = stdout.lines();
 
     loop {
-        let mut json = String::new();
         select! {
             biased;
 
@@ -159,12 +159,12 @@ async fn qemu_worker(
                 trace!("QMP: Send: {}", &reply_buf);
                 stdin.write_all(reply_buf.as_bytes()).await.unwrap();
             }
-            read = stdout.read_line(&mut json) => {
-                match read {
-                    Ok(0) => break,
-                    Ok(_) => (),
+            read = lines.next_line() => {
+                let json = match read {
+                    Ok(None) => break,
+                    Ok(Some(line)) => line,
                     Err(e) => panic!("{}", e),
-                }
+                };
 
                 trace!("QMP: Recv: {}", json.trim());
                 let data = json::parse(&json).unwrap();
