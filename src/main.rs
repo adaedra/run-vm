@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     trace!("QEMU Arguments: {:?}", &options);
     let mut child = qemu::Process::init(&options).await?;
-    info!("Qemu: Ready");
+    info!("Qemu: Pre-launch OK");
 
     let cpus = child
         .write(json::object! { "execute": "query-cpus-fast" })
@@ -98,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
         cpu_mask.set(4 + index).ok();
         sched_setaffinity(Pid::from_raw(pid as libc::pid_t), &cpu_mask)?;
     }
+
+    info!("Qemu: Ready");
 
     let signals = Signals::new(&[signal::SIGINT])?;
     let signal_handle = signals.handle();
