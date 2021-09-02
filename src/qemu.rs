@@ -92,7 +92,7 @@ impl Process {
         {
             Ok(_) => (),
             Err(e) if e.is::<Eof>() => {
-                p.finish().await;
+                p.finish().await?;
                 return Err(e.into());
             }
             Err(e) => return Err(e.into()),
@@ -122,14 +122,11 @@ impl Process {
         }
     }
 
-    pub async fn finish(self) {
-        use log::{error, trace};
+    pub async fn finish(self) -> anyhow::Result<ExitStatus> {
+        use log::trace;
         trace!("Qemu: Wait");
 
-        let res = self.worker.await.unwrap();
-        if !res.success() {
-            error!("Qemu: exited, {}", res);
-        }
+        self.worker.await.map_err(Into::into)
     }
 }
 

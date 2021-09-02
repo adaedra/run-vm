@@ -28,7 +28,10 @@ async fn handle_event(qemu: &mut qemu::Process, event: &JsonValue) -> anyhow::Re
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use log::{debug, error, info, trace};
-    use std::io::{BufRead, BufReader};
+    use std::{
+        io::{BufRead, BufReader},
+        process,
+    };
 
     {
         use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
@@ -100,10 +103,17 @@ async fn main() -> anyhow::Result<()> {
 
         if let Some(e) = error {
             if e.is::<qemu::Eof>() {
-                child.finish().await;
-                return Err(e);
+                match child.finish().await {
+                    Ok(res) if res.success() => return Ok(()),
+                    Ok(res) => {
+                        error!("Qemu: exit, {}", res);
+                        process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 error!("Error: {}", e);
+                return Err(e.into());
             }
         }
     }
