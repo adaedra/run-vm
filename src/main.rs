@@ -1,17 +1,35 @@
+use clap::Clap;
 use futures::StreamExt;
 use json::JsonValue;
 use signal_hook_tokio::Signals;
+use std::path::PathBuf;
 
 mod qemu;
 
-async fn handle_event(qemu: &mut qemu::Process, event: &JsonValue) -> anyhow::Result<()> {
+#[derive(Clap, Debug)]
+#[clap(version = env!("CARGO_PKG_VERSION"))]
+struct Options {
+    #[clap(
+        default_value = ".",
+        about = "The folder where to find the `options.txt` file"
+    )]
+    folder: PathBuf,
+    #[clap(long, about = "Wait for a client to connect to VNC before starting")]
+    wait_vnc: bool,
+}
+
+async fn handle_event(
+    qemu: &mut qemu::Process,
+    options: &Options,
+    event: &JsonValue,
+) -> anyhow::Result<()> {
     use log::debug;
 
     let name = event["event"].as_str().unwrap();
     debug!("Qemu: event {}", name);
 
     match name {
-        "VNC_INITIALIZED" => {
+        "VNC_INITIALIZED" if options.wait_vnc => {
             let res = qemu
                 .write(json::object! { "execute": "query-status" })
                 .await;
@@ -32,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     use log::{debug, error, info, trace};
     use signal_hook::consts::signal;
     use std::{
+        env,
         io::{BufRead, BufReader},
         process,
     };
@@ -48,18 +67,14 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    let root = {
-        use std::{env, path::Path};
+    let options = Options::parse();
+    dbg!(&options);
 
-        let path = env::args().skip(1).next().unwrap_or_else(|| ".".to_owned());
-        let root = Path::new(&path).canonicalize()?;
+    let root = options.folder.canonicalize()?;
+    trace!("Working directory: {}", root.display());
+    env::set_current_dir(&root)?;
 
-        trace!("Working directory: {}", root.display());
-        env::set_current_dir(&root)?;
-        root
-    };
-
-    let options = {
+    let qemu_flags = {
         use std::fs::File;
 
         let file = File::open(root.join("options.txt"))?;
@@ -77,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     };
 
-    trace!("QEMU Arguments: {:?}", &options);
-    let mut child = qemu::Process::init(&options).await?;
+    trace!("QEMU Flags: {:?}", &qemu_flags);
+    let mut child = qemu::Process::init(&qemu_flags).await?;
     info!("Qemu: Pre-launch OK");
 
     let cpus = child
@@ -105,6 +120,10 @@ async fn main() -> anyhow::Result<()> {
     let signal_handle = signals.handle();
     let mut signals = signals.fuse();
 
+    if !options.wait_vnc {
+        child.write(json::object! { "execute": "cont" }).await?;
+    }
+
     loop {
         select! {
             biased;
@@ -120,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
             }
             event = child.read_event() => {
                 let error = match event {
-                    Ok(event) => handle_event(&mut child, &event).await.err(),
+                    Ok(event) => handle_event(&mut child, &options, &event).await.err(),
                     Err(e) => Some(e),
                 };
 
