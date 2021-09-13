@@ -2,7 +2,7 @@ use clap::Clap;
 use futures::StreamExt;
 use json::JsonValue;
 use signal_hook_tokio::Signals;
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 mod qemu;
 
@@ -18,17 +18,41 @@ struct Options {
     wait_vnc: bool,
 }
 
+mod ioctl {
+    use nix::ioctl_write_ptr_bad;
+
+    const TIOCLINUX: u16 = 0x541C;
+
+    ioctl_write_ptr_bad!(tioclinux, TIOCLINUX, u8);
+}
+
+const VT_CMD_BLANK: u8 = 14;
+const VT_CMD_UNBLANK: u8 = 4;
+
+fn blank_vt(blank: bool) -> io::Result<()> {
+    let cmd = [if blank { VT_CMD_BLANK } else { VT_CMD_UNBLANK }];
+    unsafe { ioctl::tioclinux(0, cmd.as_ptr()) }?;
+    Ok(())
+}
+
 async fn handle_event(
     qemu: &mut qemu::Process,
     options: &Options,
     event: &JsonValue,
 ) -> anyhow::Result<()> {
     use log::debug;
+    use nix::unistd::isatty;
 
     let name = event["event"].as_str().unwrap();
     debug!("Qemu: event {}", name);
 
     match name {
+        "RESUME" if matches!(isatty(1), Ok(true)) => {
+            blank_vt(true).ok();
+        }
+        "SHUTDOWN" if matches!(isatty(1), Ok(true)) => {
+            blank_vt(false).ok();
+        }
         "VNC_INITIALIZED" if options.wait_vnc => {
             let res = qemu
                 .write(json::object! { "execute": "query-status" })
@@ -131,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             signal = signals.next(), if !signal_handle.is_closed() => {
                 match signal {
                     Some(signal::SIGINT) => {
+                        blank_vt(false).ok();
                         signal_handle.close();
                         child.write(json::object! { "execute": "quit" }).await.ok();
                     },
